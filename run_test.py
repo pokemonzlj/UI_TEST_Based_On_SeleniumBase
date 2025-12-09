@@ -1,131 +1,190 @@
 import subprocess
 import sys
+import os
+import threading
 from datetime import datetime
 from utils.logger import setup_logger, get_logger
 
-
-def run_tests(test_path="test_cases/", report_dir=".", extra_args=None):
-    """
-    执行UI自动化测试
+def run_test_batch(files, mode, timestamp, report_dir, extra_args, exit_codes, index):
+    """在线程中执行测试批次
 
     Args:
-        test_path: 测试用例路径，默认为"test_cases/"
-        report_dir: 报告保存目录，默认为当前目录
-        extra_args: 额外的pytest参数列表，如["-k", "test_login"]
-
-    Returns:
-        int: 测试退出码（0表示成功，非0表示失败）
-
-    使用示例:
-        # 基本使用
-        run_ui_tests()
-
-        # 指定测试路径
-        run_ui_tests(test_path="test_cases/test_login.py")
-
-        # 只运行特定测试
-        run_ui_tests(extra_args=["-k", "test_search"])
-
-        # 定时任务使用
-        import schedule
-        schedule.every().hour.do(run_ui_tests)
+        files: 测试文件列表
+        mode: 'mobile' 或 'desktop'
+        timestamp: 时间戳
+        report_dir: 报告目录
+        extra_args: 额外的 pytest 参数
+        exit_codes: 用于存储退出码的列表
+        index: 在 exit_codes 列表中的索引
     """
-    # 初始化logger
-    logger = setup_logger('ui_test')
+    logger = get_logger()
 
-    logger.info("="*70)
-    logger.info("🚀 开始执行UI自动化测试")
-    logger.info("="*70)
+    if mode == 'mobile':
+        logger.info(f"📱 正在执行移动端模式测试 ({len(files)} 个文件)")
+        report_name = f"{report_dir}/report_{timestamp}_mobile.html"
 
-    # 生成带时间戳的报告文件名
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_name = f"{report_dir}/report_{timestamp}.html"
+        cmd = [sys.executable, "-m", "pytest"] + files + [
+            "--rcs",
+            f"--html={report_name}",
+            "--self-contained-html",
+            "--tb=short",
+            "--mobile",
+            "--window-size=500,844"
+        ]
+    else:  # desktop
+        logger.info(f"🖥️  正在执行桌面模式测试 ({len(files)} 个文件)")
+        report_name = f"{report_dir}/report_{timestamp}_desktop.html"
 
-    logger.info(f"测试报告将保存为: {report_name}")
+        cmd = [sys.executable, "-m", "pytest"] + files + [
+            "--rcs",
+            f"--html={report_name}",
+            "--self-contained-html",
+            "--tb=short"
+        ]
 
-    # 构建pytest命令
-    cmd = [
-        sys.executable, "-m", "pytest",
-        test_path,
-        "--mobile",
-        "--rcs",  # 类级别复用浏览器会话（一个测试类 = 一个浏览器窗口）
-        f"--html={report_name}",
-        "--self-contained-html",  # 生成独立的HTML文件
-        "--tb=short"  # 简短的traceback（需要堆栈信息来提取错误位置）
-    ]
-
-    # 添加额外参数
     if extra_args:
         cmd.extend(extra_args)
 
+    logger.info(f"测试报告: {report_name}")
+
+    # 执行测试
+    exit_code = run_pytest_subprocess(cmd, logger)
+    exit_codes[index] = exit_code
+
+    logger.info(f"{'📱 移动端' if mode == 'mobile' else '🖥️  桌面端'}测试完成")
+
+
+def find_test_files(path):
+    """Recursively find all python test files in a directory"""
+    test_files = []
+    if os.path.isfile(path):
+        return [path]
+
+    for root, _, files in os.walk(path):
+        for file in files:
+            if file.endswith(".py") and (file.startswith("test_") or file.endswith("_test.py")):
+                test_files.append(os.path.join(root, file))
+    return test_files
+
+def run_pytest_subprocess(cmd, logger):
+    """Helper to run pytest subprocess and log output"""
     logger.info(f"执行命令: {' '.join(cmd)}")
     logger.info("="*70)
 
-    # 执行测试 - 捕获pytest的输出，只显示我们自己的日志
-    # 使用utf-8编码，避免Windows上的编码问题
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         encoding='utf-8',
-        errors='replace'  # 遇到无法解码的字符时用?替换，而不是抛出异常
+        errors='replace'
     )
 
-    # 过滤输出 - 只显示我们关心的内容
     output_lines = result.stdout.split('\n')
-    in_our_section = False  # 标记是否在我们的输出区域
+    in_our_section = True
 
     for line in output_lines:
-        # 检测到我们的统计信息开始
         if '📊 测试结果统计' in line:
             in_our_section = True
 
-        # 如果在我们的输出区域，显示所有内容
         if in_our_section:
-            # 跳过pytest自己的summary
             if 'short test summary' in line or 'FAILED test_cases' in line or 'failed in' in line:
                 continue
             print(line)
             continue
 
-        # 不在我们的区域，跳过pytest的输出
         if any(skip in line for skip in [
-            'test session starts',
-            'platform darwin',
-            'cachedir:',
-            'rootdir:',
-            'plugins:',
-            'asyncio:',
-            'collecting',
-            'collected',
-            'FAILURES',
-            '/opt/homebrew/',
-            'Stacktrace:',
-            'chromedriver',
-            'libsystem',
-            'selenium.common',
-            'seleniumbase.common',
-            'Message:',
-            'Element {'
+            'test session starts', 'platform darwin', 'cachedir:', 'rootdir:', 'plugins:',
+            'asyncio:', 'collecting', 'collected', 'FAILURES', '/opt/homebrew/',
+            'Stacktrace:', 'chromedriver', 'libsystem', 'selenium.common',
+            'seleniumbase.common', 'Message:', 'Element {'
         ]):
             continue
 
-        # 跳过pytest的错误堆栈
         if line.strip().startswith('E   '):
             continue
 
-    logger.info("="*70)
-    if result.returncode == 0:
-        logger.info("✅ 所有测试通过")
-    else:
-        logger.warning(f"⚠️  测试完成，退出码: {result.returncode}")
-    logger.info("="*70)
-
     return result.returncode
 
+def run_tests(test_path="test_cases/", report_dir=".", extra_args=None, mobile_mode=None):
+    """
+    执行UI自动化测试
+
+    Args:
+        test_path: 测试用例路径，默认为"test_cases/"
+        report_dir: 报告保存目录，默认为当前目录
+        extra_args: 额外的pytest参数列表
+        mobile_mode: 是否开启移动端模式。
+                     None(默认): 自动根据文件名包含 "_H5" 分组运行
+                     True: 强制所有用例以移动端模式运行
+                     False: 强制所有用例以桌面模式运行
+    """
+    logger = setup_logger('ui_test')
+
+    logger.info("="*70)
+    logger.info("🚀 开始执行UI自动化测试")
+
+    # 1. Determine files to run
+    all_files = find_test_files(test_path)
+    if not all_files:
+        logger.warning(f"⚠️  未找到测试文件: {test_path}")
+        return 1
+
+    # 2. Group files
+    mobile_files = []
+    desktop_files = []
+
+    if mobile_mode is True:
+        mobile_files = all_files
+    elif mobile_mode is False:
+        desktop_files = all_files
+    else:
+        # Auto-detect
+        for f in all_files:
+            if "_H5" in os.path.basename(f) or "_mobile" in os.path.basename(f):
+                mobile_files.append(f)
+            else:
+                desktop_files.append(f)
+
+    exit_codes = [0, 0]  # [mobile_exit_code, desktop_exit_code]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    threads = []
+
+    # 3. 创建并启动移动端测试线程
+    if mobile_files:
+        mobile_thread = threading.Thread(
+            target=run_test_batch,
+            args=(mobile_files, 'mobile', timestamp, report_dir, extra_args, exit_codes, 0)
+        )
+        threads.append(mobile_thread)
+        mobile_thread.start()
+        logger.info(f"📱 移动端测试线程已启动 ({len(mobile_files)} 个文件)")
+
+    # 4. 创建并启动桌面端测试线程
+    if desktop_files:
+        desktop_thread = threading.Thread(
+            target=run_test_batch,
+            args=(desktop_files, 'desktop', timestamp, report_dir, extra_args, exit_codes, 1)
+        )
+        threads.append(desktop_thread)
+        desktop_thread.start()
+        logger.info(f"🖥️  桌面端测试线程已启动 ({len(desktop_files)} 个文件)")
+
+    # 5. 等待所有线程完成
+    logger.info("⏳ 等待所有测试线程完成...")
+    for thread in threads:
+        thread.join()
+
+    logger.info("="*70)
+    final_exit_code = max(exit_codes) if exit_codes else 0
+    if final_exit_code == 0:
+        logger.info("✅ 所有测试批次执行完成")
+    else:
+        logger.warning(f"⚠️  测试执行完成，存在失败 (退出码: {final_exit_code})")
+    logger.info("="*70)
+
+    return final_exit_code
 
 if __name__ == "__main__":
-    # 直接调用封装好的测试函数
     exit_code = run_tests()
     sys.exit(exit_code)
