@@ -2,9 +2,11 @@ import pytest
 import requests
 import os
 import traceback
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from selenium import webdriver
 
 # 添加项目根目录到Python路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -22,7 +24,8 @@ test_stats = {
     'error': 0,
     'skipped': 0,
     'failed_cases': [],
-    'report_file': ''  # 存储报告文件名
+    'report_file': '',  # 存储报告文件名
+    'report_files': []  # 存储报告文件列表
 }
 
 
@@ -200,17 +203,9 @@ def pytest_runtest_makereport(item, call):
             logger.info(f"⏭️  测试跳过: {item.nodeid}")
 
 
-def send_to_wecom(test_stats):
-    """发送测试结果到企业微信"""
-    webhook_url = os.getenv('WECOM_WEBHOOK_URL')
-
-    if not webhook_url:
-        print("\n⚠️  未配置企业微信Webhook URL，跳过发送")
-        print("   提示: 设置环境变量 WECOM_WEBHOOK_URL 来启用企微通知")
-        return
-
-    # 构建markdown消息
-    content = f"""## 🧪 H5 UI自动化测试报告
+def build_report_content(test_stats):
+    """构建测试报告内容（markdown）"""
+    content = f"""## 🧪 UI自动化测试报告
 
 **测试时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
@@ -270,9 +265,33 @@ def send_to_wecom(test_stats):
 
                 case_num += 1
 
-    # 添加报告文件信息
-    if test_stats.get('report_file'):
-        content += f"\n### 📄 测试报告\n文件: `{test_stats['report_file']}`\n"
+    report_files = test_stats.get('report_files', [])
+    report_file = test_stats.get('report_file')
+    if report_files or report_file:
+        content += "\n### 📄 测试报告\n"
+        if report_file:
+            content += f"文件: `{report_file}`\n"
+        if report_files:
+            for file_name in report_files:
+                content += f"- `{file_name}`\n"
+
+    return content
+
+
+def send_to_wecom(test_stats):
+    """发送测试结果到企业微信"""
+    webhook_url = os.getenv('WECOM_WEBHOOK_URL')
+
+    # check if we should skip sending wecom message
+    if os.getenv('SKIP_WECOM'):
+        return
+
+    if not webhook_url:
+        print("\n⚠️  未配置企业微信Webhook URL，跳过发送")
+        print("   提示: 设置环境变量 WECOM_WEBHOOK_URL 来启用企微通知")
+        return
+
+    content = build_report_content(test_stats)
 
     # 构建企业微信消息体
     data = {
@@ -296,8 +315,18 @@ def send_to_wecom(test_stats):
         print(f"\n❌ 发送到企业微信失败: {str(e)}")
 
 
+def write_test_stats(stats, stats_file):
+    """将测试统计信息写入文件（JSON）"""
+    if not stats_file:
+        return
+    os.makedirs(os.path.dirname(stats_file), exist_ok=True)
+    with open(stats_file, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
-    """在测试结束后输出统计信息"""
+    """在测试结束后输出统计信息，框架钩子函数，允许用户在测试会话结束时自定义终端输出或收集测试结果。
+    这个函数在测试执行完成后被调用，可以用于生成自定义报告、统计信息或执行清理操作。"""
     print("\n" + "="*70)
     print("📊 测试结果统计")
     print("="*70)
@@ -358,6 +387,13 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
     print("\n" + "="*70)
 
+    stats_file = os.getenv('TEST_STATS_FILE')
+    if stats_file:
+        write_test_stats(test_stats, stats_file)
+
+    if os.getenv('MERGE_TEST_STATS') == '1':
+        return
+
     # 发送到企业微信
     send_to_wecom(test_stats)
 
@@ -366,11 +402,11 @@ def pytest_configure(config):
     """配置报告文件名（带时间戳）"""
     if config.option.htmlpath:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # 将 report.html 改为 report_20231107_143025.html
         htmlpath = config.option.htmlpath
         if htmlpath == 'report.html':
             report_name = f'report_{timestamp}.html'
             config.option.htmlpath = report_name
             # 保存报告文件名到全局变量
             test_stats['report_file'] = report_name
+            test_stats['report_files'].append(report_name)
 
